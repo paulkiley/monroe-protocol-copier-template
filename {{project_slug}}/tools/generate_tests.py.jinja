@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+import os, json, uuid, datetime, base64, hashlib, shutil
+from cryptography.hazmat.primitives.asymmetric import ed25519 as crypto_ed25519
+from cryptography.hazmat.primitives import serialization
+from {{ project_slug }}.utils import jcs_dumps, canonicalize, sha256_hex, merkle_root_hex
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def write(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f: f.write(data)
+
+def sign_env(e, sk, kid):
+    e = json.loads(json.dumps(e))
+    e.setdefault("integrity", {})["sig"] = {"alg":"ed25519","key_id":kid,"value":""}
+    ch = sha256_hex(canonicalize(e))
+    e["integrity"]["chain_hash"] = ch
+    e["integrity"]["sig"]["value"] = base64.b64encode(sk.sign(canonicalize(e))).decode("ascii")
+    return e
+
+def fill_prev_and_sign(envs, policy_sk, agent_sk, checkpoint=False):
+    prev = "GENESIS"
+    for i, e in enumerate(envs):
+        e["integrity"]["prev_hash"] = prev
+        if e["route"]["sender"] == "Policy-Authority":
+            e = sign_env(e, policy_sk, "monroe/policy/ed25519-policy")
+        else:
+            e = sign_env(e, agent_sk, "agent/protocol-aware/ed25519-k1")
+        envs[i] = e; prev = e["integrity"]["chain_hash"]
+    if checkpoint:
+        root_hex = merkle_root_hex([e["integrity"]["chain_hash"] for e in envs])
+        e_last = envs[-1]
+        e_last.setdefault("integrity", {}).setdefault("checkpoint", {})
+        e_last["integrity"]["checkpoint"]["root"] = root_hex
+        e_last["integrity"]["checkpoint"]["coverage"] = {"from_msg": envs[0]["id"]["message"], "to_msg": envs[-1]["id"]["message"]}
+        payload = {"root": root_hex, "coverage": e_last["integrity"]["checkpoint"]["coverage"]}
+        # Reuse policy_sk for snapshot:
+        e_last["integrity"]["checkpoint"]["snapshot_sig"] = {
+            "alg":"ed25519","key_id":"monroe/policy/ed25519-policy",
+            "value": base64.b64encode(policy_sk.sign(jcs_dumps(payload).encode("utf-8"))).decode("ascii")
+        }
+
+def main():
+    tests_dir = os.path.join(ROOT, "tests")
+    if os.path.exists(tests_dir): shutil.rmtree(tests_dir)
+    os.makedirs(tests_dir, exist_ok=True)
+
+    # Keys
+    policy_sk = crypto_ed25519.Ed25519PrivateKey.generate()
+    agent_sk = crypto_ed25519.Ed25519PrivateKey.generate()
+    def pubkey_b64(sk):
+        pk = sk.public_key()
+        raw = pk.public_bytes(encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+        return base64.b64encode(raw).decode("ascii")
+    trust = [
+        {"key_id":"monroe/policy/ed25519-policy","alg":"ed25519","public_key":pubkey_b64(policy_sk)},
+        {"key_id":"agent/protocol-aware/ed25519-k1","alg":"ed25519","public_key":pubkey_b64(agent_sk)}
+    ]
+    write(os.path.join(ROOT, "keys.json"), json.dumps(trust, indent=2))
+
+    session_id = "session-{{ project_slug }}"
+    ts_base = datetime.datetime(2025, 1, 1, 0, 0, 0)
+    ts = lambda n: (ts_base + datetime.timedelta(seconds=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    new_msg_id = lambda: str(uuid.uuid4())
+
+    # T1 baseline (4 msgs)
+    envs = []
+    envs.append({"protocol":{"spec":"monroe/log-v2"},"active_policy":{"identity_check_required": True},"session":{"id":session_id},"id":{"message":new_msg_id()},
+"time":{"utc":ts(0)},"route":{"sender":"Policy-Authority"},"subject":"Genesis","content":{"type":"init"},"integrity":{"prev_hash":"GENESIS"}})
+    envs.append({"protocol":{"spec":"monroe/log-v2"},"session":{"id":session_id},"id":{"message":new_msg_id(),"reply_to":envs[0]["id"]["message"]},"time":{"utc":ts(10)},"route":{"sender":"Policy-Authority"},"subject":"Identity Challenge","content":{"type":"events","body":{"data":[{"kind":"identity-challenge"}]}},"integrity":{"prev_hash":""}})
+    envs.append({"protocol":{"spec":"monroe/log-v2"},"session":{"id":session_id},"id":{"message":new_msg_id(),"reply_to":envs[1]["id"]["message"]},"time":{"utc":ts(20)},"route":{"sender":"Agent"},"subject":"Identity Response","content":{"type":"events","body":{"echo_json":{"session_id":session_id}}},"integrity":{"prev_hash":""}})
+    envs.append({"protocol":{"spec":"monroe/log-v2"},"session":{"id":session_id},"id":{"message":new_msg_id(),"reply_to":envs[2]["id"]["message"]},"time":{"utc":ts(30)},"route":{"sender":"Policy-Authority"},"subject":"Checkpoint","content":{"type":"checkpoint"},"integrity":{"prev_hash":""}})
+
+    fill_prev_and_sign(envs, policy_sk, agent_sk, checkpoint=True)
+
+    def dump_test(name, envs, expected):
+        base = os.path.join(tests_dir, name)
+        os.makedirs(base, exist_ok=True)
+        with open(os.path.join(base, "log.jsonl"), "w", encoding="utf-8") as f:
+            for e in envs:
+                f.write(jcs_dumps(e) + "\n")
+        with open(os.path.join(base, "expected.json"), "w", encoding="utf-8") as f:
+            json.dump(expected, f, indent=2)
+
+    dump_test("T1", envs, {"ok": True, "last_msg": envs[-1]["id"]["message"], "last_chain_hash": envs[-1]["integrity"]["chain_hash"]})
+
+    # T2: CHAIN_BREAK
+    t2 = json.loads(json.dumps(envs)); t2[2]["integrity"]["prev_hash"] = "DEADBEEF"
+    dump_test("T2", t2, {"ok": False, "reason": "CHAIN_BREAK", "offender": t2[2]["id"]["message"]})
+
+    # T3: KEY_UNKNOWN
+    t3 = json.loads(json.dumps(envs)); t3[1]["integrity"]["sig"]["key_id"] = "unknown/key"
+    dump_test("T3", t3, {"ok": False, "reason": "KEY_UNKNOWN", "offender": t3[1]["id"]["message"], "key_id":"unknown/key"})
+
+    # T4: BAD_CHECKPOINT_SIG
+    t4 = json.loads(json.dumps(envs))
+    b = bytearray(base64.b64decode(t4[-1]["integrity"]["checkpoint"]["snapshot_sig"]["value"])); b[0]^=1
+    t4[-1]["integrity"]["checkpoint"]["snapshot_sig"]["value"] = base64.b64encode(bytes(b)).decode("ascii")
+    dump_test("T4", t4, {"ok": False, "reason": "BAD_CHECKPOINT_SIG"})
+
+    print("Generated fixtures in tests/ (T1..T4).")
+
+if __name__ == "__main__":
+    main()

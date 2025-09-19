@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+import json, os, base64, hashlib
+from cryptography.hazmat.primitives.asymmetric import ed25519 as crypto_ed25519
+from cryptography.exceptions import InvalidSignature
+from .utils import jcs_dumps, canonicalize, sha256_hex, merkle_root_hex
+
+def load_trust(path):
+    trust = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for item in json.load(f):
+            trust[item["key_id"]] = item
+    return trust
+
+def verify_sig(env, trust, require_signatures):
+    sig = env.get("integrity", {}).get("sig", {})
+    key_id = sig.get("key_id")
+    sig_b64 = sig.get("value")
+    if require_signatures and (not key_id or not sig_b64):
+        return False, "MISSING_SIG", None
+    if not key_id or not sig_b64:
+        return True, None, None
+    kb = trust.get(key_id)
+    if kb is None:
+        return False, "KEY_UNKNOWN", key_id
+    try:
+        pk = crypto_ed25519.Ed25519PublicKey.from_public_bytes(base64.b64decode(kb["public_key"]))
+        pk.verify(base64.b64decode(sig_b64), canonicalize(env))
+        return True, None, None
+    except InvalidSignature:
+        return False, "BAD_SIG", key_id
+
+def verify_checkpoint(last_env, chain_hashes, trust):
+    cp = last_env.get("integrity", {}).get("checkpoint")
+    if not isinstance(cp, dict):
+        return None, None
+    recomputed_root = merkle_root_hex(chain_hashes)
+    if recomputed_root != cp.get("root"):
+        return None, {"ok": False, "reason": "BAD_CHECKPOINT"}
+    snap = cp.get("snapshot_sig")
+    if not isinstance(snap, dict):
+        return None, {"ok": False, "reason": "MISSING_CHECKPOINT_SIG"}
+    key_id = snap.get("key_id")
+    kb = trust.get(key_id)
+    if not kb:
+        return None, {"ok": False, "reason": "KEY_UNKNOWN", "key_id": key_id}
+    payload = {"root": cp.get("root"), "coverage": cp.get("coverage")}
+    payload_bytes = jcs_dumps(payload).encode("utf-8")
+    try:
+        pk = crypto_ed25519.Ed25519PublicKey.from_public_bytes(base64.b64decode(kb["public_key"]))
+        pk.verify(base64.b64decode(snap.get("value","")), payload_bytes)
+    except InvalidSignature:
+        return None, {"ok": False, "reason": "BAD_CHECKPOINT_SIG", "key_id": key_id}
+    return recomputed_root, None
+
+def validate(log_path, trust_path, require_signatures=False):
+    envelopes = []
+    with open(log_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                envelopes.append(json.loads(line))
+
+    trust = load_trust(trust_path) if trust_path and os.path.exists(trust_path) else {}
+
+    prev_hash = "GENESIS"
+    adr_state = {}
+    signers_seen = set()
+    chain_hashes = []
+    lock_required = False
+    identity_attested = False
+
+    for idx, env in enumerate(envelopes):
+        mid = env.get("id", {}).get("message", f"idx-{idx}")
+        ap = env.get("active_policy")
+        if isinstance(ap, dict) and ap.get("identity_check_required") is True:
+            lock_required = True
+
+        claimed_prev = env.get("integrity", {}).get("prev_hash")
+        if claimed_prev != prev_hash:
+            return {"ok": False, "reason": "CHAIN_BREAK", "offender": mid, "expected_prev": prev_hash, "got_prev": claimed_prev}
+        recomputed = sha256_hex(canonicalize(env))
+        claimed_chain = env.get("integrity", {}).get("chain_hash")
+        if recomputed != claimed_chain:
+            return {"ok": False, "reason": "BAD_CHAIN_HASH", "offender": mid}
+        chain_hashes.append(claimed_chain)
+        prev_hash = claimed_chain
+
+        ok, err, meta = verify_sig(env, trust, require_signatures)
+        if not ok:
+            if err == "KEY_UNKNOWN":
+                return {"ok": False, "reason": "KEY_UNKNOWN", "offender": mid, "key_id": meta}
+            return {"ok": False, "reason": err, "offender": mid}
+
+        key_id = env.get("integrity", {}).get("sig", {}).get("key_id")
+        if key_id:
+            signers_seen.add(key_id)
+
+        if env.get("content", {}).get("type") == "events":
+            echo = env.get("content", {}).get("body", {}).get("echo_json")
+            if isinstance(echo, dict) and set(echo.keys()) == {"challenge_id", "nonce", "session_id"}:
+                identity_attested = True
+
+        for a in env.get("governance", {}).get("adr", []):
+            if "id" in a and "status" in a:
+                adr_state[a["id"]] = a["status"]
+            if lock_required and not identity_attested and a.get("status") == "ACTIVE":
+                actor = env.get("route", {}).get("sender", "UNKNOWN")
+                return {"ok": False, "reason": "POLICY_LOCK", "actor": actor, "msg": mid}
+
+    checkpoint_root, cp_err = verify_checkpoint(envelopes[-1], chain_hashes, trust)
+    if cp_err:
+        return cp_err
+    return {"ok": True, "last_msg": envelopes[-1]["id"]["message"], "last_chain_hash": envelopes[-1]["integrity"]["chain_hash"], "adr_state": adr_state, "signers_seen": sorted(signers_seen), "checkpoint_root": checkpoint_root}
